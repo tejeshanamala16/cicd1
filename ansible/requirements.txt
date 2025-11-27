@@ -1,0 +1,5 @@
+ansible>=6.0.0
+kubernetes>=2.0.0
+openshift>=0.12.0
+docker>=5.0.0
+

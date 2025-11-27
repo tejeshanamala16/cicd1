@@ -1,0 +1,274 @@
+---
+- name: Deploy Social Media Platform to Kubernetes
+  hosts: kubernetes
+  become: yes
+  vars:
+    docker_registry: "{{ docker_registry | default('your-registry.io') }}"
+    build_number: "{{ build_number | default('latest') }}"
+    namespace: "social-media"
+    kubeconfig_path: "/root/.kube/config"
+    
+  tasks:
+    - name: Check if kubectl is installed
+      command: which kubectl
+      register: kubectl_check
+      changed_when: false
+      failed_when: false
+
+    - name: Install kubectl if not present
+      block:
+        - name: Download kubectl
+          get_url:
+            url: https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl
+            dest: /usr/local/bin/kubectl
+            mode: '0755'
+      when: kubectl_check.rc != 0
+
+    - name: Verify kubectl installation
+      command: kubectl version --client
+      register: kubectl_version
+      changed_when: false
+
+    - name: Display kubectl version
+      debug:
+        msg: "{{ kubectl_version.stdout }}"
+
+    - name: Check if namespace exists
+      kubernetes.core.k8s_info:
+        kind: Namespace
+        name: "{{ namespace }}"
+        kubeconfig: "{{ kubeconfig_path }}"
+      register: namespace_info
+      failed_when: false
+
+    - name: Create namespace if it doesn't exist
+      kubernetes.core.k8s:
+        name: "{{ namespace }}"
+        api_version: v1
+        kind: Namespace
+        kubeconfig: "{{ kubeconfig_path }}"
+      when: namespace_info.resources | length == 0
+
+    - name: Apply ConfigMap
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: social-media-config
+            namespace: "{{ namespace }}"
+          data:
+            DB_HOST: "mysql-service"
+            DB_PORT: "3306"
+            DB_NAME: "social_media_db"
+            PORT: "5000"
+            REACT_APP_API_URL: "http://backend-service:5000/api"
+        kubeconfig: "{{ kubeconfig_path }}"
+
+    - name: Apply Secrets
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: social-media-secrets
+            namespace: "{{ namespace }}"
+          type: Opaque
+          stringData:
+            DB_USER: "root"
+            DB_PASSWORD: "{{ db_password | default('change-me') }}"
+            JWT_SECRET: "{{ jwt_secret | default('change-me') }}"
+        kubeconfig: "{{ kubeconfig_path }}"
+      no_log: true
+
+    - name: Apply MySQL PersistentVolumeClaim
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: mysql-pvc
+            namespace: "{{ namespace }}"
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 10Gi
+        kubeconfig: "{{ kubeconfig_path }}"
+
+    - name: Apply MySQL Deployment
+      kubernetes.core.k8s:
+        state: present
+        src: "{{ playbook_dir }}/../k8s/mysql-deployment.yaml"
+        kubeconfig: "{{ kubeconfig_path }}"
+
+    - name: Wait for MySQL to be ready
+      kubernetes.core.k8s_info:
+        kind: Pod
+        namespace: "{{ namespace }}"
+        label_selectors:
+          - app=mysql
+        kubeconfig: "{{ kubeconfig_path }}"
+      register: mysql_pods
+      until: mysql_pods.resources | selectattr('status.phase', 'equalto', 'Running') | list | length > 0
+      retries: 30
+      delay: 10
+
+    - name: Initialize MySQL database
+      kubernetes.core.k8s_exec:
+        namespace: "{{ namespace }}"
+        pod: "{{ mysql_pods.resources[0].metadata.name }}"
+        command: |
+          mysql -uroot -p{{ db_password | default('change-me') }} social_media_db < /tmp/database.sql || true
+      when: mysql_pods.resources | length > 0
+      failed_when: false
+
+    - name: Update backend deployment with new image
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: backend
+            namespace: "{{ namespace }}"
+          spec:
+            replicas: 3
+            selector:
+              matchLabels:
+                app: backend
+            template:
+              metadata:
+                labels:
+                  app: backend
+              spec:
+                containers:
+                - name: backend
+                  image: "{{ docker_registry }}/social-media-backend:{{ build_number }}"
+                  imagePullPolicy: Always
+                  ports:
+                  - containerPort: 5000
+                  env:
+                  - name: DB_HOST
+                    valueFrom:
+                      configMapKeyRef:
+                        name: social-media-config
+                        key: DB_HOST
+                  - name: DB_PORT
+                    valueFrom:
+                      configMapKeyRef:
+                        name: social-media-config
+                        key: DB_PORT
+                  - name: DB_NAME
+                    valueFrom:
+                      configMapKeyRef:
+                        name: social-media-config
+                        key: DB_NAME
+                  - name: PORT
+                    valueFrom:
+                      configMapKeyRef:
+                        name: social-media-config
+                        key: PORT
+                  - name: DB_USER
+                    valueFrom:
+                      secretKeyRef:
+                        name: social-media-secrets
+                        key: DB_USER
+                  - name: DB_PASSWORD
+                    valueFrom:
+                      secretKeyRef:
+                        name: social-media-secrets
+                        key: DB_PASSWORD
+                  - name: JWT_SECRET
+                    valueFrom:
+                      secretKeyRef:
+                        name: social-media-secrets
+                        key: JWT_SECRET
+                  resources:
+                    requests:
+                      memory: "256Mi"
+                      cpu: "250m"
+                    limits:
+                      memory: "512Mi"
+                      cpu: "500m"
+        kubeconfig: "{{ kubeconfig_path }}"
+
+    - name: Update frontend deployment with new image
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: frontend
+            namespace: "{{ namespace }}"
+          spec:
+            replicas: 2
+            selector:
+              matchLabels:
+                app: frontend
+            template:
+              metadata:
+                labels:
+                  app: frontend
+              spec:
+                containers:
+                - name: frontend
+                  image: "{{ docker_registry }}/social-media-frontend:{{ build_number }}"
+                  imagePullPolicy: Always
+                  ports:
+                  - containerPort: 80
+                  resources:
+                    requests:
+                      memory: "128Mi"
+                      cpu: "100m"
+                    limits:
+                      memory: "256Mi"
+                      cpu: "200m"
+        kubeconfig: "{{ kubeconfig_path }}"
+
+    - name: Apply backend service
+      kubernetes.core.k8s:
+        state: present
+        src: "{{ playbook_dir }}/../k8s/backend-deployment.yaml"
+        kubeconfig: "{{ kubeconfig_path }}"
+
+    - name: Apply frontend service
+      kubernetes.core.k8s:
+        state: present
+        src: "{{ playbook_dir }}/../k8s/frontend-deployment.yaml"
+        kubeconfig: "{{ kubeconfig_path }}"
+
+    - name: Wait for backend deployment to be ready
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        name: backend
+        namespace: "{{ namespace }}"
+        kubeconfig: "{{ kubeconfig_path }}"
+      register: backend_deployment
+      until: backend_deployment.resources[0].status.readyReplicas == backend_deployment.resources[0].spec.replicas
+      retries: 30
+      delay: 10
+
+    - name: Wait for frontend deployment to be ready
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        name: frontend
+        namespace: "{{ namespace }}"
+        kubeconfig: "{{ kubeconfig_path }}"
+      register: frontend_deployment
+      until: frontend_deployment.resources[0].status.readyReplicas == frontend_deployment.resources[0].spec.replicas
+      retries: 30
+      delay: 10
+
+    - name: Display deployment status
+      debug:
+        msg:
+          - "Backend replicas ready: {{ backend_deployment.resources[0].status.readyReplicas }}/{{ backend_deployment.resources[0].spec.replicas }}"
+          - "Frontend replicas ready: {{ frontend_deployment.resources[0].status.readyReplicas }}/{{ frontend_deployment.resources[0].spec.replicas }}"
+          - "Deployment completed successfully!"
+

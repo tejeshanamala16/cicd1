@@ -1,0 +1,71 @@
+---
+- name: Install Ansible and dependencies
+  hosts: localhost
+  connection: local
+  become: yes
+  vars:
+    ansible_python_interpreter: python3
+    
+  tasks:
+    - name: Check if Python 3 is installed
+      command: python3 --version
+      register: python_check
+      changed_when: false
+      failed_when: false
+
+    - name: Install Python 3 and pip (Ubuntu/Debian)
+      apt:
+        name:
+          - python3
+          - python3-pip
+          - python3-venv
+        state: present
+        update_cache: yes
+      when: ansible_os_family == "Debian" and python_check.rc != 0
+
+    - name: Install Python 3 and pip (RHEL/CentOS)
+      yum:
+        name:
+          - python3
+          - python3-pip
+        state: present
+      when: ansible_os_family == "RedHat" and python_check.rc != 0
+
+    - name: Install Ansible
+      pip:
+        name:
+          - ansible>=6.0.0
+          - kubernetes>=2.0.0
+          - openshift>=0.12.0
+          - docker>=5.0.0
+        state: present
+        executable: pip3
+
+    - name: Verify Ansible installation
+      command: ansible --version
+      register: ansible_version
+      changed_when: false
+
+    - name: Display Ansible version
+      debug:
+        msg: "{{ ansible_version.stdout_lines }}"
+
+    - name: Create Ansible configuration directory
+      file:
+        path: /etc/ansible
+        state: directory
+        mode: '0755'
+
+    - name: Create ansible.cfg if it doesn't exist
+      copy:
+        content: |
+          [defaults]
+          inventory = ./ansible/inventory.ini
+          host_key_checking = False
+          remote_user = root
+          roles_path = ./ansible/roles
+          retry_files_enabled = False
+        dest: /etc/ansible/ansible.cfg
+        mode: '0644'
+      when: not ansible_check.stat.exists
+
